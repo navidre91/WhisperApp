@@ -3,3 +3,4 @@ sounddevice>=0.4
 soundfile>=0.12
 numpy>=1.25
 openai>=1.40
+openai-whisper>=20240918

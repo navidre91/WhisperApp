@@ -81,3 +81,34 @@ You can transcribe the original and denoised WAVs using OpenAI’s Whisper API.
    ```
 
 By default the script looks for pairs like `name.wav` and `name-denoised.wav`. Use `--all` to transcribe every audio file in a directory, or pass specific paths.
+
+## Local (Offline) Whisper
+
+If you prefer to run Whisper locally without the API, use the provided script that wraps the open-source model.
+
+Prerequisites:
+- Install ffmpeg (macOS): `brew install ffmpeg`
+- Install PyTorch (choose the right wheel for your platform): https://pytorch.org/get-started/locally/
+- Install Whisper:
+  ```bash
+  pip install -U openai-whisper
+  ```
+
+Usage:
+```bash
+# Transcribe pairs found under samples/ and write transcripts
+python scripts/transcribe_local_whisper.py --dir samples --write
+
+# Transcribe specific files with a chosen model and auto device
+python scripts/transcribe_local_whisper.py samples/1.wav samples/1-denoised.wav \
+  --model small --device auto --write
+
+# Force language or switch to translation task
+python scripts/transcribe_local_whisper.py --dir samples --language en --task translate --write
+```
+
+Notes:
+- The first run will download the selected model (e.g., `small`, `medium`, `large-v3`) into your cache.
+- `--device auto` will prefer CUDA if available, then Apple `mps`, else CPU.
+- On CPU or Apple `mps`, the script uses fp32 for stability; on CUDA it uses fp16.
+- For multilingual examples and advanced settings, see the official notebook: https://github.com/openai/whisper/blob/main/notebooks/Multilingual_ASR.ipynb
