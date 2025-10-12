@@ -1,3 +1,7 @@
 #folderd
 .venv/
-samples/ 
+samples/
+build/
+dist/
+samples/
+__pycache__/

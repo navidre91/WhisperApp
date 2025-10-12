@@ -4,12 +4,13 @@ Cross-platform microphone recorder GUI for macOS.
 Features:
     * Enumerate CoreAudio inputs and try to preselect AirPods.
     * Record audio directly to WAV while keeping the UI responsive.
-    * Optional real-time voice isolation powered by RNNoise if available.
+    * Optional real-time voice isolation powered by RNNoise when available.
+    * Built-in spectral gating fallback when RNNoise is missing.
 
 Dependencies (install inside a venv):
     pip install PySide6 sounddevice soundfile numpy
     # Optional
-    pip install rnnoise
+    pip install rnnoise          # real-time voice isolation (where available)
 """
 
 from __future__ import annotations
@@ -20,7 +21,8 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -72,6 +74,9 @@ class AudioRecorder:
 
         self._use_ns = False
         self._ns_engine = rnnoise.RNNoise() if rnnoise else None
+        self._ns_mode: Optional[str] = None
+        self._processed_output: Optional[str] = None
+        self._processed_error: Optional[str] = None
 
     @property
     def running(self) -> bool:
@@ -97,11 +102,45 @@ class AudioRecorder:
                 )
         return inputs
 
+    def available_ns_backends(self) -> List[str]:
+        backends: List[str] = []
+        if rnnoise is not None:
+            backends.append("module")
+        backends.append("spectral")
+        return backends
+
     def choose_device(self, device_index: int) -> None:
         self._device_index = device_index
 
-    def enable_noise_suppression(self, enabled: bool) -> None:
-        self._use_ns = enabled and self._ns_engine is not None
+    def enable_noise_suppression(self, enabled: bool) -> str:
+        if not enabled:
+            self._ns_mode = None
+            self._use_ns = False
+            return "off"
+
+        if rnnoise is not None:
+            if self._ns_engine is None:
+                try:
+                    self._ns_engine = rnnoise.RNNoise()
+                except Exception:
+                    self._ns_engine = None
+            if self._ns_engine is not None:
+                self._ns_mode = "module"
+                self._use_ns = True
+                return "module"
+
+        # Fallback to spectral gating (post-process)
+        self._ns_mode = "spectral"
+        self._use_ns = False
+        return "spectral"
+
+        self._ns_mode = None
+        self._use_ns = False
+        return "unavailable"
+
+    @property
+    def ns_backend(self) -> Optional[str]:
+        return self._ns_mode
 
     def start(self, target_path: str, samplerate: Optional[int] = None) -> None:
         if self._device_index is None:
@@ -112,6 +151,8 @@ class AudioRecorder:
 
         self._samplerate = sr
         self._target_path = target_path
+        self._processed_output = None
+        self._processed_error = None
         self._soundfile = sf.SoundFile(
             target_path,
             mode="w",
@@ -143,9 +184,9 @@ class AudioRecorder:
         )
         self._stream.start()
 
-    def stop(self) -> None:
+    def stop(self) -> Tuple[Optional[str], Optional[str]]:
         if not self._running:
-            return
+            return None, None
 
         self._running = False
 
@@ -162,6 +203,11 @@ class AudioRecorder:
             self._soundfile.flush()
             self._soundfile.close()
             self._soundfile = None
+
+        if self._ns_mode == "spectral" and self._target_path:
+            self._processed_output, self._processed_error = self._run_spectral(Path(self._target_path))
+
+        return self._processed_output, self._processed_error
 
     def elapsed_seconds(self) -> int:
         if not self._running:
@@ -184,7 +230,7 @@ class AudioRecorder:
             self._soundfile.write(self._process(self._queue.get()))
 
     def _process(self, data: np.ndarray) -> np.ndarray:
-        if not self._use_ns or self._ns_engine is None:
+        if self._ns_mode != "module" or self._ns_engine is None:
             return data
 
         if self._samplerate != 48_000:
@@ -208,6 +254,82 @@ class AudioRecorder:
             processed = np.concatenate([processed, remainder.astype(np.float32)], axis=0)
 
         return processed.reshape(data.shape)
+
+    def _run_spectral(self, source: Path) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            data, sr = sf.read(str(source), dtype="float32")
+        except Exception as exc:
+            return None, f"Failed to read recording: {exc}"
+
+        if data.ndim > 1:
+            mono = data.mean(axis=1)
+        else:
+            mono = data
+
+        try:
+            enhanced = self._spectral_gate(mono, sr)
+        except Exception as exc:
+            return None, f"Spectral gating error: {exc}"
+
+        destination = source.with_name(f"{source.stem}-denoised{source.suffix}")
+        counter = 1
+        while destination.exists():
+            destination = source.with_name(f"{source.stem}-denoised-{counter}{source.suffix}")
+            counter += 1
+
+        try:
+            sf.write(str(destination), enhanced, sr)
+        except Exception as exc:
+            return None, f"Failed to write denoised file: {exc}"
+
+        return str(destination), None
+
+    @staticmethod
+    def _spectral_gate(signal: np.ndarray, samplerate: int) -> np.ndarray:
+        """Simple spectral gating noise suppression."""
+        frame_size = 1024
+        hop = frame_size // 4
+        window = np.hanning(frame_size).astype(np.float32)
+
+        # Pad signal for overlap-add
+        padded = np.pad(signal, (frame_size, frame_size), mode="reflect")
+        n_frames = 1 + (len(padded) - frame_size) // hop
+
+        frames = np.lib.stride_tricks.as_strided(
+            padded,
+            shape=(n_frames, frame_size),
+            strides=(padded.strides[0] * hop, padded.strides[0]),
+            writeable=False,
+        ).copy()
+
+        frames *= window[None, :]
+
+        spectrum = np.fft.rfft(frames, axis=1)
+        magnitude = np.abs(spectrum)
+        phase = np.angle(spectrum)
+
+        noise_frames = max(4, int(0.2 * samplerate / hop))
+        noise_profile = np.median(magnitude[:noise_frames], axis=0)
+
+        floor = 0.05
+        reduction = 0.95
+        gain = 1.0 - reduction * (noise_profile / (magnitude + 1e-6))
+        gain = np.clip(gain, floor, 1.0)
+
+        processed = gain * magnitude * np.exp(1j * phase)
+        enhanced_frames = np.fft.irfft(processed, axis=1)
+        enhanced_frames *= window[None, :]
+
+        output = np.zeros(len(padded), dtype=np.float32)
+        for i in range(n_frames):
+            start = i * hop
+            output[start : start + frame_size] += enhanced_frames[i]
+
+        result = output[frame_size : frame_size + len(signal)]
+        max_abs = np.max(np.abs(result))
+        if max_abs > 1.0:
+            result = result / max_abs
+        return result.astype(np.float32)
 
 
 class MainWindow(QMainWindow):
@@ -247,16 +369,26 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.setMinimumWidth(460)
 
-        if rnnoise is None:
+        backends = self._recorder.available_ns_backends()
+        if not backends:
             self._ns_checkbox.setChecked(False)
             self._ns_checkbox.setEnabled(False)
-            self._ns_checkbox.setToolTip("Install the 'rnnoise' package to enable voice isolation.")
+            self._ns_checkbox.setToolTip("Install 'rnnoise' to enable voice isolation.")
+        else:
+            self._ns_checkbox.setEnabled(True)
+            descriptions = []
+            if "module" in backends:
+                descriptions.append("real-time (rnnoise)")
+            if "spectral" in backends:
+                descriptions.append("post-process (spectral gate)")
+            joined = ", ".join(descriptions)
+            self._ns_checkbox.setToolTip(f"Enable voice isolation: {joined}.")
 
     def _bind_signals(self) -> None:
         self._refresh_btn.clicked.connect(self._populate_devices)
         self._device_combo.currentIndexChanged.connect(self._on_device_changed)
         self._record_btn.clicked.connect(self._toggle_recording)
-        self._ns_checkbox.toggled.connect(self._recorder.enable_noise_suppression)
+        self._ns_checkbox.toggled.connect(self._on_ns_toggled)
 
     def _populate_devices(self) -> None:
         devices = self._recorder.available_devices()
@@ -283,6 +415,23 @@ class MainWindow(QMainWindow):
         device_index = self._device_combo.itemData(combo_index)
         if device_index is not None:
             self._recorder.choose_device(int(device_index))
+
+    def _on_ns_toggled(self, enabled: bool) -> None:
+        backend = self._recorder.enable_noise_suppression(enabled)
+        if backend == "unavailable":
+            self._ns_checkbox.blockSignals(True)
+            self._ns_checkbox.setChecked(False)
+            self._ns_checkbox.blockSignals(False)
+            message = "Voice isolation unavailable – install rnnoise."
+        elif backend == "module":
+            message = "Voice isolation enabled (real-time)."
+        elif backend == "spectral":
+            message = "Voice isolation enabled (post-process spectral gate)."
+        else:
+            message = "Voice isolation disabled."
+
+        if not self._recorder.running:
+            self._status_label.setText(message)
 
     def _toggle_recording(self) -> None:
         if not self._recorder.running:
@@ -314,19 +463,39 @@ class MainWindow(QMainWindow):
             return
 
         self._record_btn.setText("Stop")
-        self._status_label.setText(f"Recording → {target_path}")
+        ns_desc = self._describe_ns_backend()
+        self._status_label.setText(f"Recording [{ns_desc}] → {target_path}")
         self._timer.start()
 
     def _stop_recording(self) -> None:
-        self._recorder.stop()
+        processed_path, error = self._recorder.stop()
         self._record_btn.setText("Record")
-        self._status_label.setText("Idle")
         self._timer.stop()
+        target = self._recorder.target_path
+
+        if processed_path:
+            self._status_label.setText(f"Denoised copy saved → {processed_path}")
+        elif error:
+            base = f"Recorded → {target}" if target else "Recorded."
+            self._status_label.setText(f"{base} Voice isolation failed: {error}")
+        else:
+            self._status_label.setText("Idle")
 
     def _update_elapsed(self) -> None:
         elapsed = self._recorder.elapsed_seconds()
         destination = self._recorder.target_path or "<unknown>"
-        self._status_label.setText(f"Recording ({elapsed // 60:02d}:{elapsed % 60:02d}) → {destination}")
+        ns_desc = self._describe_ns_backend()
+        self._status_label.setText(
+            f"Recording {elapsed // 60:02d}:{elapsed % 60:02d} [{ns_desc}] → {destination}"
+        )
+
+    def _describe_ns_backend(self) -> str:
+        backend = self._recorder.ns_backend
+        if backend == "module":
+            return "voice isolation: real-time"
+        if backend == "spectral":
+            return "voice isolation: spectral gate"
+        return "voice isolation: off"
 
 
 def main() -> None:
