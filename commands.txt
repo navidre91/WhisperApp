@@ -1,0 +1,5 @@
+python scripts/stream_whisper.py --rolling-log --input-device 3 --device cpu --model base --log-file transcripts.log --keep-context --condition-on-prev-text --context-limit 1000 --energy-threshold 0.0 --language en --verbose
+python scripts/stream_whisper.py --rolling-log --input-device 0 --device cpu --model base --log-file transcripts.log --keep-context --condition-on-prev-text --context-limit 1000 --energy-threshold 0.0 --language en --verbose
+python scripts/stream_whisper.py --rolling-log --input-device 0 --device cpu --model small --log-file transcripts.log --keep-context --context-limit 100 --energy-threshold 0.000005 --language en --verbose
+
+python scripts/stream_whisper.py --list-devices
